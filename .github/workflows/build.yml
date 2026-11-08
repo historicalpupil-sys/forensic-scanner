@@ -1,0 +1,1574 @@
+name: Build Forensic 3D Scanner APK
+
+
+
+on:
+
+  push:
+
+    branches: [ "main", "master" ]
+
+  workflow_dispatch:
+
+
+
+jobs:
+
+  build-apk:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+
+
+
+      - name: Set up JDK 17
+
+        uses: actions/setup-java@v4
+
+        with:
+
+          distribution: 'temurin'
+
+          java-version: '17'
+
+
+
+      - name: Set up Flutter 3.24
+
+        uses: subosito/flutter-action@v2
+
+        with:
+
+          flutter-version: '3.24.0'
+
+          channel: 'stable'
+
+
+
+      - name: Scaffold Flutter Android project and inject Forensic 3D Scanner sources
+
+        run: |
+
+          flutter create --org com.forensicscanner --project-name app --platforms android scanner_app
+
+          python3 - << 'PY'
+
+          import pathlib, re
+
+
+
+          root = pathlib.Path("scanner_app")
+
+
+
+          # 1. Patch AndroidManifest.xml with Camera & Sensor permissions
+
+          manifest_path = root / "android/app/src/main/AndroidManifest.xml"
+
+          manifest_txt = manifest_path.read_text(encoding="utf-8")
+
+          perms = """
+
+              <uses-permission android:name="android.permission.CAMERA" />
+
+              <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <uses-feature android:name="android.hardware.camera" android:required="true" />
+
+              <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true" />
+
+          """
+
+          manifest_txt = manifest_txt.replace("<application", perms + "\n    <application", 1)
+
+          manifest_path.write_text(manifest_txt, encoding="utf-8")
+
+
+
+          # 2. Patch android/app/build.gradle for minSdk 26, compileSdk 34, and CameraX 1.3.4
+
+          gradle_path = root / "android/app/build.gradle"
+
+          gradle_txt = gradle_path.read_text(encoding="utf-8")
+
+          gradle_txt = re.sub(r"minSdk\s*=?\s*[\w.]+", "minSdk = 26", gradle_txt)
+
+          gradle_txt = re.sub(r"minSdkVersion\s+[\w.]+", "minSdkVersion 26", gradle_txt)
+
+          gradle_txt = re.sub(r"compileSdk\s*=?\s*[\w.]+", "compileSdk = 34", gradle_txt)
+
+          gradle_txt = re.sub(r"compileSdkVersion\s+[\w.]+", "compileSdkVersion 34", gradle_txt)
+
+          gradle_txt += """
+
+
+
+          dependencies {
+
+              def camerax_version = "1.3.4"
+
+              implementation "androidx.camera:camera-core:${camerax_version}"
+
+              implementation "androidx.camera:camera-camera2:${camerax_version}"
+
+              implementation "androidx.camera:camera-lifecycle:${camerax_version}"
+
+              implementation "androidx.camera:camera-view:${camerax_version}"
+
+              implementation "androidx.core:core-ktx:1.12.0"
+
+              implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.7.0"
+
+              implementation "androidx.concurrent:concurrent-futures:1.1.0"
+
+              implementation "com.google.guava:guava:32.1.3-android"
+
+          }
+
+          """
+
+          gradle_path.write_text(gradle_txt, encoding="utf-8")
+
+
+
+          # 3. Write ForensicCameraCaptureManager.kt
+
+          kt_dir = root / "android/app/src/main/kotlin/com/forensicscanner/app"
+
+          kt_dir.mkdir(parents=True, exist_ok=True)
+
+
+
+          (kt_dir / "ForensicCameraCaptureManager.kt").write_text('''package com.forensicscanner.app
+
+
+
+          import android.annotation.SuppressLint
+
+          import android.content.Context
+
+          import android.hardware.Sensor
+
+          import android.hardware.SensorEvent
+
+          import android.hardware.SensorEventListener
+
+          import android.hardware.SensorManager
+
+          import android.hardware.camera2.CameraCaptureSession
+
+          import android.hardware.camera2.CameraCharacteristics
+
+          import android.hardware.camera2.CaptureRequest
+
+          import android.hardware.camera2.CaptureResult
+
+          import android.hardware.camera2.TotalCaptureResult
+
+          import androidx.annotation.OptIn
+
+          import androidx.camera.camera2.interop.Camera2CameraControl
+
+          import androidx.camera.camera2.interop.Camera2CameraInfo
+
+          import androidx.camera.camera2.interop.Camera2Interop
+
+          import androidx.camera.camera2.interop.CaptureRequestOptions
+
+          import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+
+          import androidx.camera.core.Camera
+
+          import androidx.camera.core.CameraSelector
+
+          import androidx.camera.core.FocusMeteringAction
+
+          import androidx.camera.core.ImageCapture
+
+          import androidx.camera.core.ImageCaptureException
+
+          import androidx.camera.core.Preview
+
+          import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+
+          import androidx.camera.core.resolutionselector.ResolutionSelector
+
+          import androidx.camera.core.resolutionselector.ResolutionStrategy
+
+          import androidx.camera.lifecycle.ProcessCameraProvider
+
+          import androidx.core.content.ContextCompat
+
+          import androidx.lifecycle.LifecycleOwner
+
+          import org.json.JSONArray
+
+          import org.json.JSONObject
+
+          import java.io.File
+
+          import java.io.FileInputStream
+
+          import java.security.MessageDigest
+
+          import java.time.Instant
+
+          import java.util.concurrent.ExecutorService
+
+          import java.util.concurrent.Executors
+
+          import kotlin.math.atan2
+
+          import kotlin.math.sqrt
+
+
+
+          @OptIn(ExperimentalCamera2Interop::class)
+
+          class ForensicCameraCaptureManager(
+
+              private val context: Context,
+
+              private val lifecycleOwner: LifecycleOwner
+
+          ) : SensorEventListener {
+
+
+
+              private var camera: Camera? = null
+
+              private var imageCapture: ImageCapture? = null
+
+              private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+              private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+
+
+
+              @Volatile var isOpticalStateLocked: Boolean = false
+
+                  private set
+
+              @Volatile var lockedFocusDistanceDiopters: Float = 0.0f
+
+                  private set
+
+              @Volatile var lastFocalLengthMm: Float = 4.71f
+
+                  private set
+
+              @Volatile var lastIso: Int = 100
+
+                  private set
+
+              @Volatile var lastExposureTimeNs: Long = 10_000_000L
+
+                  private set
+
+
+
+              @Volatile var currentPitchDeg: Double = 0.0
+
+                  private set
+
+              @Volatile var currentRollDeg: Double = 0.0
+
+                  private set
+
+
+
+              private var sensorWidthMm: Float = 6.40f
+
+              private var sensorHeightMm: Float = 4.80f
+
+              private val capturedFrames = mutableListOf<JSONObject>()
+
+              private var sessionDir: File = File(context.getExternalFilesDir(null), "scans/default_session")
+
+              private var rawImagesDir: File = File(sessionDir, "raw_images")
+
+
+
+              fun startSession(
+
+                  caseId: String,
+
+                  evidenceId: String,
+
+                  surfaceProvider: Preview.SurfaceProvider,
+
+                  onInitialized: (Map<String, Any>) -> Unit
+
+              ) {
+
+                  val timestamp = Instant.now().toString().replace(":", "-")
+
+                  sessionDir = File(context.getExternalFilesDir(null), "scans/${caseId}_${evidenceId}_$timestamp")
+
+                  rawImagesDir = File(sessionDir, "raw_images").apply { mkdirs() }
+
+                  capturedFrames.clear()
+
+                  isOpticalStateLocked = false
+
+
+
+                  sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let {
+
+                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+
+                  } ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
+
+                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+
+                  }
+
+
+
+                  val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+
+                  cameraProviderFuture.addListener({
+
+                      val cameraProvider = cameraProviderFuture.get()
+
+                      val resolutionSelector = ResolutionSelector.Builder()
+
+                          .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+
+                          .build()
+
+
+
+                      val preview = Preview.Builder()
+
+                          .setResolutionSelector(resolutionSelector)
+
+                          .build()
+
+                          .also { it.setSurfaceProvider(surfaceProvider) }
+
+
+
+                      val imageCaptureBuilder = ImageCapture.Builder()
+
+                          .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+
+                          .setResolutionSelector(resolutionSelector)
+
+
+
+                      Camera2Interop.Extender(imageCaptureBuilder).setSessionCaptureCallback(
+
+                          object : CameraCaptureSession.CaptureCallback() {
+
+                              override fun onCaptureCompleted(
+
+                                  session: CameraCaptureSession,
+
+                                  request: CaptureRequest,
+
+                                  result: TotalCaptureResult
+
+                              ) {
+
+                                  result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let {
+
+                                      if (!isOpticalStateLocked) lockedFocusDistanceDiopters = it
+
+                                  }
+
+                                  result.get(CaptureResult.LENS_FOCAL_LENGTH)?.let {
+
+                                      lastFocalLengthMm = it
+
+                                  }
+
+                                  result.get(CaptureResult.SENSOR_SENSITIVITY)?.let {
+
+                                      lastIso = it
+
+                                  }
+
+                                  result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let {
+
+                                      lastExposureTimeNs = it
+
+                                  }
+
+                              }
+
+                          }
+
+                      )
+
+
+
+                      imageCapture = imageCaptureBuilder.build()
+
+                      cameraProvider.unbindAll()
+
+                      camera = cameraProvider.bindToLifecycle(
+
+                          lifecycleOwner,
+
+                          CameraSelector.DEFAULT_BACK_CAMERA,
+
+                          preview,
+
+                          imageCapture
+
+                      )
+
+
+
+                      camera?.cameraInfo?.let { info ->
+
+                          val c2Info = Camera2CameraInfo.from(info)
+
+                          c2Info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)?.let { size ->
+
+                              sensorWidthMm = size.width
+
+                              sensorHeightMm = size.height
+
+                          }
+
+                          c2Info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.let { focals ->
+
+                              if (focals.isNotEmpty()) lastFocalLengthMm = focals[0]
+
+                          }
+
+                      }
+
+
+
+                      onInitialized(
+
+                          mapOf(
+
+                              "session_dir" to sessionDir.absolutePath,
+
+                              "sensor_width_mm" to sensorWidthMm.toDouble(),
+
+                              "sensor_height_mm" to sensorHeightMm.toDouble(),
+
+                              "focal_length_mm" to lastFocalLengthMm.toDouble()
+
+                          )
+
+                      )
+
+                  }, ContextCompat.getMainExecutor(context))
+
+              }
+
+
+
+              @SuppressLint("RestrictedApi")
+
+              fun lockFocusAndOpticsForPhotogrammetry(onLocked: (Boolean, Float) -> Unit) {
+
+                  val cam = camera ?: run {
+
+                      onLocked(false, 0.0f)
+
+                      return
+
+                  }
+
+                  val factory = SurfaceOrientedMeteringPointFactory(1.0f, 1.0f)
+
+                  val centerPoint = factory.createPoint(0.5f, 0.5f)
+
+                  val action = FocusMeteringAction.Builder(centerPoint, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+
+                      .disableAutoCancel()
+
+                      .build()
+
+
+
+                  val future = cam.cameraControl.startFocusAndMetering(action)
+
+                  future.addListener({
+
+                      try {
+
+                          val c2Control = Camera2CameraControl.from(cam.cameraControl)
+
+                          val options = CaptureRequestOptions.Builder()
+
+                              .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+
+                              .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, lockedFocusDistanceDiopters)
+
+                              .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, true)
+
+                              .setCaptureRequestOption(
+
+                                  CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+
+                                  CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+
+                              )
+
+                              .setCaptureRequestOption(
+
+                                  CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+
+                                  CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+
+                              )
+
+                              .build()
+
+
+
+                          c2Control.addCaptureRequestOptions(options).addListener({
+
+                              isOpticalStateLocked = true
+
+                              onLocked(true, lockedFocusDistanceDiopters)
+
+                          }, ContextCompat.getMainExecutor(context))
+
+                      } catch (e: Exception) {
+
+                          onLocked(false, 0.0f)
+
+                      }
+
+                  }, ContextCompat.getMainExecutor(context))
+
+              }
+
+
+
+              fun captureForensicFrame(
+
+                  captureTier: String,
+
+                  onCaptured: (Map<String, Any>) -> Unit,
+
+                  onError: (String) -> Unit
+
+              ) {
+
+                  if (!isOpticalStateLocked) {
+
+                      onError("Optical state (AF/AE/OIS) must be locked before capturing photogrammetry frames.")
+
+                      return
+
+                  }
+
+                  val cap = imageCapture ?: run {
+
+                      onError("ImageCapture not initialized.")
+
+                      return
+
+                  }
+
+                  if (!rawImagesDir.exists()) rawImagesDir.mkdirs()
+
+                  val idx = capturedFrames.size
+
+                  val fileName = String.format("frame_%03d.jpg", idx)
+
+                  val photoFile = File(rawImagesDir, fileName)
+
+                  val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
+
+
+
+                  cap.takePicture(
+
+                      outputOptions,
+
+                      cameraExecutor,
+
+                      object : ImageCapture.OnImageSavedCallback {
+
+                          override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+
+                              val sha256 = computeSha256(photoFile)
+
+                              val utcNow = Instant.now().toString()
+
+                              val frameJson = JSONObject().apply {
+
+                                  put("frame_index", idx)
+
+                                  put("filename", "raw_images/$fileName")
+
+                                  put("sha256", sha256)
+
+                                  put("timestamp_utc", utcNow)
+
+                                  put("focal_length_mm", lastFocalLengthMm.toDouble())
+
+                                  put("focus_distance_diopters", lockedFocusDistanceDiopters.toDouble())
+
+                                  put("iso", lastIso)
+
+                                  put("exposure_time_ns", lastExposureTimeNs)
+
+                                  put("capture_tier", captureTier)
+
+                                  put("imu_pitch_deg", currentPitchDeg)
+
+                                  put("imu_roll_deg", currentRollDeg)
+
+                              }
+
+                              synchronized(capturedFrames) {
+
+                                  capturedFrames.add(frameJson)
+
+                              }
+
+                              onCaptured(
+
+                                  mapOf(
+
+                                      "frame_index" to idx,
+
+                                      "filename" to "raw_images/$fileName",
+
+                                      "sha256" to sha256,
+
+                                      "imu_pitch_deg" to currentPitchDeg,
+
+                                      "imu_roll_deg" to currentRollDeg
+
+                                  )
+
+                              )
+
+                          }
+
+
+
+                          override fun onError(exception: ImageCaptureException) {
+
+                              onError(exception.message ?: "Image capture failed")
+
+                          }
+
+                      }
+
+                  )
+
+              }
+
+
+
+              fun finalizeEvidenceBundle(
+
+                  caseId: String,
+
+                  evidenceId: String,
+
+                  impressionType: String,
+
+                  investigatorNotes: String
+
+              ): Map<String, Any> {
+
+                  sensorManager.unregisterListener(this)
+
+                  if (!sessionDir.exists()) sessionDir.mkdirs()
+
+                  val framesArray = JSONArray()
+
+                  synchronized(capturedFrames) {
+
+                      capturedFrames.forEach { framesArray.put(it) }
+
+                  }
+
+
+
+                  val manifest = JSONObject().apply {
+
+                      put("schema_version", "1.0.0")
+
+                      put("case_id", caseId)
+
+                      put("evidence_id", evidenceId)
+
+                      put("impression_type", impressionType)
+
+                      put("investigator_notes", investigatorNotes)
+
+                      put("camera_intrinsics", JSONObject().apply {
+
+                          put("focal_length_mm", lastFocalLengthMm.toDouble())
+
+                          put("sensor_width_mm", sensorWidthMm.toDouble())
+
+                          put("sensor_height_mm", sensorHeightMm.toDouble())
+
+                          put("af_locked", isOpticalStateLocked)
+
+                          put("ae_locked", isOpticalStateLocked)
+
+                          put("ois_disabled", isOpticalStateLocked)
+
+                          put("video_stabilization_disabled", isOpticalStateLocked)
+
+                      })
+
+                      put("scale_artifact", JSONObject().apply {
+
+                          put("type", "forensic_l_scale_aruco")
+
+                          put("aruco_dictionary", "DICT_4X4_50")
+
+                          put("aruco_marker_size_mm", 20.0)
+
+                          put("inter_marker_distances_mm", JSONObject().apply {
+
+                              put("0-1", 100.0)
+
+                              put("2-3", 100.0)
+
+                          })
+
+                      })
+
+                      put("frames", framesArray)
+
+                  }
+
+
+
+                  val manifestFile = File(sessionDir, "manifest.json")
+
+                  manifestFile.writeText(manifest.toString(2), Charsets.UTF_8)
+
+                  val manifestHash = computeSha256(manifestFile)
+
+
+
+                  return mapOf(
+
+                      "bundle_path" to sessionDir.absolutePath,
+
+                      "manifest_sha256" to manifestHash,
+
+                      "total_frames" to capturedFrames.size
+
+                  )
+
+              }
+
+
+
+              private fun computeSha256(file: File): String {
+
+                  val digest = MessageDigest.getInstance("SHA-256")
+
+                  FileInputStream(file).use { fis ->
+
+                      val buffer = ByteArray(65536)
+
+                      var read = fis.read(buffer)
+
+                      while (read != -1) {
+
+                          digest.update(buffer, 0, read)
+
+                          read = fis.read(buffer)
+
+                      }
+
+                  }
+
+                  return digest.digest().joinToString("") { "%02x".format(it) }
+
+              }
+
+
+
+              override fun onSensorChanged(event: SensorEvent?) {
+
+                  event ?: return
+
+                  val gx = event.values[0].toDouble()
+
+                  val gy = event.values[1].toDouble()
+
+                  val gz = event.values[2].toDouble()
+
+                  val norm = sqrt(gx * gx + gy * gy + gz * gz)
+
+                  if (norm > 0.1) {
+
+                      currentPitchDeg = Math.toDegrees(atan2(sqrt(gx * gx + gy * gy), gz))
+
+                      currentRollDeg = Math.toDegrees(atan2(gx, gy))
+
+                  }
+
+              }
+
+
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+          }
+
+          ''', encoding="utf-8")
+
+
+
+          # 4. Write MainActivity.kt
+
+          (kt_dir / "MainActivity.kt").write_text('''package com.forensicscanner.app
+
+
+
+          import android.Manifest
+
+          import android.content.Context
+
+          import android.content.pm.PackageManager
+
+          import android.os.Bundle
+
+          import android.view.View
+
+          import androidx.camera.view.PreviewView
+
+          import androidx.core.app.ActivityCompat
+
+          import androidx.core.content.ContextCompat
+
+          import io.flutter.embedding.android.FlutterActivity
+
+          import io.flutter.embedding.engine.FlutterEngine
+
+          import io.flutter.plugin.common.MethodChannel
+
+          import io.flutter.plugin.common.StandardMessageCodec
+
+          import io.flutter.plugin.platform.PlatformView
+
+          import io.flutter.plugin.platform.PlatformViewFactory
+
+
+
+          class MainActivity : FlutterActivity() {
+
+              private val CHANNEL = "com.forensicscanner.app/camera"
+
+              private lateinit var captureManager: ForensicCameraCaptureManager
+
+
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+
+                  super.onCreate(savedInstanceState)
+
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+
+                      != PackageManager.PERMISSION_GRANTED
+
+                  ) {
+
+                      ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
+
+                  }
+
+              }
+
+
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+
+                  super.configureFlutterEngine(flutterEngine)
+
+                  captureManager = ForensicCameraCaptureManager(this, this)
+
+
+
+                  flutterEngine
+
+                      .platformViewsController
+
+                      .registry
+
+                      .registerViewFactory(
+
+                          "com.forensicscanner.app/preview",
+
+                          object : PlatformViewFactory(StandardMessageCodec.INSTANCE) {
+
+                              override fun create(context: Context, viewId: Int, args: Any?): PlatformView {
+
+                                  val pv = PreviewView(context)
+
+                                  captureManager.startSession(
+
+                                      caseId = "CASE-2026-001",
+
+                                      evidenceId = "EVID-01",
+
+                                      surfaceProvider = pv.surfaceProvider,
+
+                                      onInitialized = {}
+
+                                  )
+
+                                  return object : PlatformView {
+
+                                      override fun getView(): View = pv
+
+                                      override fun dispose() {}
+
+                                  }
+
+                              }
+
+                          }
+
+                      )
+
+
+
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+
+                      .setMethodCallHandler { call, result ->
+
+                          when (call.method) {
+
+                              "lockFocusAndOptics" -> {
+
+                                  captureManager.lockFocusAndOpticsForPhotogrammetry { locked, diopters ->
+
+                                      result.success(
+
+                                          mapOf(
+
+                                              "locked" to locked,
+
+                                              "focus_diopters" to diopters.toDouble(),
+
+                                              "pitch_deg" to captureManager.currentPitchDeg,
+
+                                              "roll_deg" to captureManager.currentRollDeg
+
+                                          )
+
+                                      )
+
+                                  }
+
+                              }
+
+                              "captureForensicFrame" -> {
+
+                                  val tier = call.argument<String>("capture_tier") ?: "nadir_0_15deg"
+
+                                  captureManager.captureForensicFrame(
+
+                                      captureTier = tier,
+
+                                      onCaptured = { meta ->
+
+                                          runOnUiThread { result.success(meta) }
+
+                                      },
+
+                                      onError = { err ->
+
+                                          runOnUiThread { result.error("CAPTURE_ERR", err, null) }
+
+                                      }
+
+                                  )
+
+                              }
+
+                              "finalizeEvidenceBundle" -> {
+
+                                  val caseId = call.argument<String>("case_id") ?: "CASE-2026-001"
+
+                                  val evidenceId = call.argument<String>("evidence_id") ?: "EVID-01"
+
+                                  val impType = call.argument<String>("impression_type") ?: "footwear_soil_concave"
+
+                                  val notes = call.argument<String>("investigator_notes") ?: ""
+
+                                  val summary = captureManager.finalizeEvidenceBundle(caseId, evidenceId, impType, notes)
+
+                                  result.success(summary)
+
+                              }
+
+                              else -> result.notImplemented()
+
+                          }
+
+                      }
+
+              }
+
+          }
+
+          ''', encoding="utf-8")
+
+
+
+          # 5. Write lib/main.dart
+
+          lib_dir = root / "lib"
+
+          (lib_dir / "main.dart").write_text('''import 'package:flutter/material.dart';
+
+          import 'package:flutter/services.dart';
+
+
+
+          void main() {
+
+            WidgetsFlutterBinding.ensureInitialized();
+
+            runApp(const ForensicScannerApp());
+
+          }
+
+
+
+          class ForensicScannerApp extends StatelessWidget {
+
+            const ForensicScannerApp({super.key});
+
+
+
+            @override
+
+            Widget build(BuildContext context) {
+
+              return MaterialApp(
+
+                title: 'Forensic 3D Scanner',
+
+                debugShowCheckedModeBanner: false,
+
+                theme: ThemeData.dark(useMaterial3: true).copyWith(
+
+                  colorScheme: ColorScheme.fromSeed(
+
+                    seedColor: const Color(0xFF10B981),
+
+                    brightness: Brightness.dark,
+
+                  ),
+
+                ),
+
+                home: const ForensicCaptureScreen(
+
+                  caseId: 'CASE-2026-UZ-001',
+
+                  evidenceId: 'EVID-SHOE-01',
+
+                ),
+
+              );
+
+            }
+
+          }
+
+
+
+          class ForensicCaptureScreen extends StatefulWidget {
+
+            final String caseId;
+
+            final String evidenceId;
+
+            final String impressionType;
+
+
+
+            const ForensicCaptureScreen({
+
+              super.key,
+
+              required this.caseId,
+
+              required this.evidenceId,
+
+              this.impressionType = 'footwear_soil_concave',
+
+            });
+
+
+
+            @override
+
+            State<ForensicCaptureScreen> createState() => _ForensicCaptureScreenState();
+
+          }
+
+
+
+          class _ForensicCaptureScreenState extends State<ForensicCaptureScreen> {
+
+            static const MethodChannel _channel =
+
+                MethodChannel('com.forensicscanner.app/camera');
+
+
+
+            bool _isLocked = false;
+
+            double _lockedDiopters = 0.0;
+
+            int _frameCount = 0;
+
+            String _lastSha256 = 'None';
+
+            String _selectedTier = 'nadir_0_15deg';
+
+            String _statusMessage =
+
+                'Step 1: Place rigid ArUco L-scale at impression plane, frame nadir view, and lock optics.';
+
+
+
+            final Map<String, int> _tierCounts = {
+
+              'nadir_0_15deg': 0,
+
+              'mid_oblique_35deg': 0,
+
+              'low_oblique_55deg': 0,
+
+            };
+
+
+
+            Future<void> _lockOptics() async {
+
+              try {
+
+                final Map<dynamic, dynamic>? res =
+
+                    await _channel.invokeMethod('lockFocusAndOptics');
+
+                if (res != null && res['locked'] == true) {
+
+                  setState(() {
+
+                    _isLocked = true;
+
+                    _lockedDiopters = (res['focus_diopters'] as num).toDouble();
+
+                    _statusMessage =
+
+                        'Optics locked (${_lockedDiopters.toStringAsFixed(2)} D, OIS OFF, AE LOCKED). Ready to capture.';
+
+                  });
+
+                }
+
+              } on PlatformException catch (e) {
+
+                setState(() {
+
+                  _statusMessage = 'Lock error: ${e.message}';
+
+                });
+
+              }
+
+            }
+
+
+
+            Future<void> _captureFrame() async {
+
+              if (!_isLocked) return;
+
+              try {
+
+                final Map<dynamic, dynamic>? res = await _channel.invokeMethod(
+
+                  'captureForensicFrame',
+
+                  {'capture_tier': _selectedTier},
+
+                );
+
+                if (res != null) {
+
+                  setState(() {
+
+                    _frameCount += 1;
+
+                    _tierCounts[_selectedTier] = (_tierCounts[_selectedTier] ?? 0) + 1;
+
+                    _lastSha256 = (res['sha256'] as String).substring(0, 16);
+
+                    _statusMessage =
+
+                        'Saved frame #$_frameCount (SHA-256: $_lastSha256...)';
+
+                  });
+
+                }
+
+              } on PlatformException catch (e) {
+
+                setState(() {
+
+                  _statusMessage = 'Capture failed: ${e.message}';
+
+                });
+
+              }
+
+            }
+
+
+
+            Future<void> _sealEvidenceBundle() async {
+
+              try {
+
+                final Map<dynamic, dynamic>? res = await _channel.invokeMethod(
+
+                  'finalizeEvidenceBundle',
+
+                  {
+
+                    'case_id': widget.caseId,
+
+                    'evidence_id': widget.evidenceId,
+
+                    'impression_type': widget.impressionType,
+
+                    'investigator_notes': 'Captured with locked intrinsics and ArUco L-scale',
+
+                  },
+
+                );
+
+                if (res != null) {
+
+                  setState(() {
+
+                    _statusMessage =
+
+                        'Evidence bundle sealed! Manifest SHA-256: ${(res['manifest_sha256'] as String).substring(0, 16)}...';
+
+                  });
+
+                }
+
+              } on PlatformException catch (e) {
+
+                setState(() {
+
+                  _statusMessage = 'Seal failed: ${e.message}';
+
+                });
+
+              }
+
+            }
+
+
+
+            @override
+
+            Widget build(BuildContext context) {
+
+              return Scaffold(
+
+                backgroundColor: Colors.black,
+
+                appBar: AppBar(
+
+                  backgroundColor: Colors.grey.shade900,
+
+                  title: Text('Forensic 3D Capture — ${widget.evidenceId}'),
+
+                ),
+
+                body: Column(
+
+                  children: [
+
+                    Expanded(
+
+                      child: Stack(
+
+                        fit: StackFit.expand,
+
+                        children: [
+
+                          const AndroidView(viewType: 'com.forensicscanner.app/preview'),
+
+                          IgnorePointer(
+
+                            child: CustomPaint(
+
+                              painter: _ForensicOverlayPainter(isLocked: _isLocked),
+
+                            ),
+
+                          ),
+
+                          Positioned(
+
+                            top: 12,
+
+                            left: 12,
+
+                            right: 12,
+
+                            child: Container(
+
+                              padding: const EdgeInsets.all(10),
+
+                              decoration: BoxDecoration(
+
+                                color: Colors.black87,
+
+                                borderRadius: BorderRadius.circular(8),
+
+                              ),
+
+                              child: Text(
+
+                                _statusMessage,
+
+                                style: const TextStyle(color: Colors.white, fontSize: 13),
+
+                              ),
+
+                            ),
+
+                          ),
+
+                        ],
+
+                      ),
+
+                    ),
+
+                    Container(
+
+                      color: Colors.grey.shade900,
+
+                      padding: const EdgeInsets.all(16),
+
+                      child: Column(
+
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+
+                        children: [
+
+                          SegmentedButton<String>(
+
+                            segments: [
+
+                              ButtonSegment(
+
+                                value: 'nadir_0_15deg',
+
+                                label: Text('Nadir (${_tierCounts['nadir_0_15deg']}/8)'),
+
+                              ),
+
+                              ButtonSegment(
+
+                                value: 'mid_oblique_35deg',
+
+                                label: Text('35° Ring (${_tierCounts['mid_oblique_35deg']}/12)'),
+
+                              ),
+
+                              ButtonSegment(
+
+                                value: 'low_oblique_55deg',
+
+                                label: Text('55° Ring (${_tierCounts['low_oblique_55deg']}/8)'),
+
+                              ),
+
+                            ],
+
+                            selected: {_selectedTier},
+
+                            onSelectionChanged: (Set<String> selection) {
+
+                              setState(() => _selectedTier = selection.first);
+
+                            },
+
+                          ),
+
+                          const SizedBox(height: 12),
+
+                          Row(
+
+                            children: [
+
+                              Expanded(
+
+                                child: ElevatedButton.icon(
+
+                                  onPressed: _isLocked ? null : _lockOptics,
+
+                                  icon: Icon(_isLocked ? Icons.lock : Icons.lock_open),
+
+                                  label: Text(_isLocked ? 'Optics Locked' : '1. Lock AF/AE/OIS'),
+
+                                ),
+
+                              ),
+
+                              const SizedBox(width: 10),
+
+                              Expanded(
+
+                                child: ElevatedButton.icon(
+
+                                  onPressed: _isLocked ? _captureFrame : null,
+
+                                  icon: const Icon(Icons.camera_alt),
+
+                                  label: Text('2. Capture ($_frameCount)'),
+
+                                ),
+
+                              ),
+
+                              const SizedBox(width: 10),
+
+                              ElevatedButton(
+
+                                onPressed: _frameCount >= 8 ? _sealEvidenceBundle : null,
+
+                                child: const Text('3. Seal'),
+
+                              ),
+
+                            ],
+
+                          ),
+
+                        ],
+
+                      ),
+
+                    ),
+
+                  ],
+
+                ),
+
+              );
+
+            }
+
+          }
+
+
+
+          class _ForensicOverlayPainter extends CustomPainter {
+
+            final bool isLocked;
+
+            const _ForensicOverlayPainter({required this.isLocked});
+
+
+
+            @override
+
+            void paint(Canvas canvas, Size size) {
+
+              final paint = Paint()
+
+                ..color = isLocked ? Colors.greenAccent : Colors.amberAccent
+
+                ..style = PaintingStyle.stroke
+
+                ..strokeWidth = 2.0;
+
+
+
+              final lScalePath = Path()
+
+                ..moveTo(size.width * 0.12, size.height * 0.15)
+
+                ..lineTo(size.width * 0.12, size.height * 0.82)
+
+                ..lineTo(size.width * 0.85, size.height * 0.82);
+
+              canvas.drawPath(lScalePath, paint);
+
+            }
+
+
+
+            @override
+
+            bool shouldRepaint(covariant _ForensicOverlayPainter oldDelegate) =>
+
+                oldDelegate.isLocked != isLocked;
+
+          }
+
+          ''', encoding="utf-8")
+
+          print("Injected Forensic 3D Scanner Android & Flutter sources successfully.")
+
+          PY
+
+
+
+      - name: Build Android Debug & Release APKs
+
+        working-directory: scanner_app
+
+        run: |
+
+          flutter pub get
+
+          flutter build apk --debug
+
+          flutter build apk --release
+
+
+
+      - name: Upload Compiled Android APKs
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: UniversalForensicScanner-Android-APKs
+
+          path: |
+
+            scanner_app/build/app/outputs/flutter-apk/app-debug.apk
+
+            scanner_app/build/app/outputs/flutter-apk/app-release.apk
+
